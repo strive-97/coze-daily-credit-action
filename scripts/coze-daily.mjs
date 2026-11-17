@@ -41,8 +41,17 @@ const CLAIMED_MARKERS = [
 // Elements worth looking at when the claim entry is not on the landing page.
 const CANDIDATE_PATTERN = "积分|签到|领取|任务|权益|额度|credit|point|check.?in";
 const CLAIMABLE_TEXT_PATTERN = "领取|签到|积分|免费积分|额度|权益|Get|Claim";
+const STRONG_TEXT_PATTERN = "领取|签到|Claim|Get";
 const FOLLOWUP_TEXT_PATTERN = "领取|签到";
 const CREDIT_LINE_PATTERN = "积分|签到|领取|额度|权益";
+// Never click these: they open payment / upsell flows.
+const AVOID_TEXT_PATTERN = "增购|购买|充值|续费|支付|付款|开票|订单|开通|升级|订阅|剩余|积分管理|积分单位";
+const EXPAND_TEXTS = ["查看全部任务", "全部任务", "更多任务", "任务中心"];
+// A click that opens one of these stops the confirm stage outright.
+const PAYMENT_PATTERN = /支付|扣款|付款|购买|订单|开通|发票|\d+\s*元|¥/;
+// https://www.coze.cn/ lands on an account-specific /session/<id> page that carries the
+// "积分剩余 100%" entry, which opens the credit management page.
+const CREDIT_PAGE_URL = "https://www.coze.cn/subscription/manage";
 const EXTRA_PROBE_URLS = ["https://www.coze.cn/", "https://www.coze.cn/overview"];
 
 async function main() {
@@ -84,7 +93,15 @@ async function main() {
       await classifyClaimState(page, report);
     }
 
+    await openCreditPage(page, report);
+
     await context.storageState({ path: UPDATED_STORAGE_STATE_PATH });
+
+    const creditPageReadable = Boolean(report.creditPage?.finalUrl) &&
+      !/login|passport|sso|signin/i.test(report.creditPage.finalUrl);
+    if (report.outcome === "unknown" && (report.balance || creditPageReadable)) {
+      report.outcome = "no-entry";
+    }
 
     console.log("Claim report:", JSON.stringify(report, null, 2));
     console.log(`Coze daily visit completed: ${targetUrl}`);
@@ -98,8 +115,8 @@ async function main() {
         .join("、") || "无";
       const unknownError = new Error(
         `签到结果未知：落地页 ${report.url || targetUrl}（标题：${report.pageTitle || "无"}）` +
-        `既没有可点击的领取入口，也没有“已领取/已签到”标记。疑似入口元素：${preview}。` +
-        `页面积分相关文本：${(report.creditLines || []).slice(0, 4).join(" / ") || "无"}。` +
+        `既没有可点击的领取入口，也没有“已领取/已签到”标记，而且积分管理页也读不到余额（可能已掉登录）。` +
+        `疑似入口元素：${preview}。页面积分相关文本：${(report.creditLines || []).slice(0, 4).join(" / ") || "无"}。` +
         `完整清单见运行日志的 Claim report，页面截图在 coze-failure artifact 里。`
       );
       await captureFailure(context, unknownError);
@@ -108,7 +125,7 @@ async function main() {
 
     if (process.env.COZE_NOTIFY_SUCCESS !== "0") {
       const notified = await notifyResult({
-        title: report.outcome === "already-claimed" ? "Coze每日积分：今日已领取过" : "Coze每日积分：已执行",
+        title: notificationTitle(report),
         content: buildSuccessMessage(report)
       });
       if (notified) {
@@ -237,6 +254,7 @@ async function claimDaily(page) {
     candidates: [],
     probed: [],
     creditLines: [],
+    creditPage: null,
     balance: null,
     pageTitle: "",
     url: "",
@@ -266,11 +284,18 @@ async function clickClaimControls(page, report, texts) {
     .map((item) => item.trim())
     .filter(Boolean);
   const clickTexts = texts || (configuredTexts.length ? configuredTexts : DEFAULT_CLICK_TEXTS);
+  const avoid = new RegExp(AVOID_TEXT_PATTERN, "i");
 
   for (const text of clickTexts) {
     const locator = page.getByText(text, { exact: false }).first();
     const visible = await locator.isVisible().catch(() => false);
     if (!visible) continue;
+
+    const elementText = await locator.innerText().catch(() => "");
+    if (avoid.test(elementText)) {
+      console.log(`Skipped "${text}": "${elementText.replace(/\s+/g, " ").slice(0, 60)}" looks like a payment entry.`);
+      continue;
+    }
 
     const html = await describeElement(locator);
     await locator.click({ timeout: 5000 }).catch(() => {});
@@ -278,6 +303,13 @@ async function clickClaimControls(page, report, texts) {
     console.log(`Clicked possible claim control: ${text}`);
     await page.waitForTimeout(2000);
     report.creditLines = await extractCreditLines(page);
+
+    const dialogText = await getDialogText(page);
+    if (PAYMENT_PATTERN.test(dialogText)) {
+      console.log(`A payment-looking dialog is open ("${dialogText.slice(0, 80)}"); refusing to confirm anything.`);
+      report.paymentGuard = dialogText.slice(0, 200);
+      break;
+    }
 
     for (const confirmText of CONFIRM_TEXTS) {
       const confirm = page.getByText(confirmText, { exact: false }).first();
@@ -312,6 +344,24 @@ function recordClick(report, text, html, url) {
 async function describeElement(locator) {
   return locator
     .evaluate((el) => el.outerHTML.replace(/\s+/g, " ").trim().slice(0, 200))
+    .catch(() => "");
+}
+
+async function getDialogText(page) {
+  return page
+    .evaluate(() => {
+      const scopes = document.querySelectorAll(
+        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="popup"], [class*="Popup"], [class*="drawer"]'
+      );
+      let text = "";
+      for (const el of scopes) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          text += " " + (el.innerText || "");
+        }
+      }
+      return text.replace(/\s+/g, " ").trim().slice(0, 3000);
+    })
     .catch(() => "");
 }
 
@@ -372,8 +422,8 @@ async function harvestClaimCandidates(page) {
 }
 
 async function probeAlternateEntries(page, report) {
-  const claimable = new RegExp(CLAIMABLE_TEXT_PATTERN, "i");
   const followUp = new RegExp(FOLLOWUP_TEXT_PATTERN);
+  const avoid = new RegExp(AVOID_TEXT_PATTERN, "i");
   const urls = EXTRA_PROBE_URLS.filter((url) => url && url !== page.url());
 
   for (const url of urls) {
@@ -390,7 +440,7 @@ async function probeAlternateEntries(page, report) {
     }
 
     const candidates = await harvestClaimCandidates(page);
-    const entry = candidates.find((item) => item.visible && claimable.test(item.text));
+    const entry = pickClaimTarget(candidates, [STRONG_TEXT_PATTERN, CLAIMABLE_TEXT_PATTERN]);
     report.probed.push({
       url,
       finalUrl: page.url(),
@@ -409,7 +459,9 @@ async function probeAlternateEntries(page, report) {
     if (report.clicked.length) {
       await settle(page);
       const inside = await harvestClaimCandidates(page);
-      const target = inside.find((item) => item.visible && item.text !== entry.text && followUp.test(item.text));
+      const target = inside.find(
+        (item) => item.visible && item.text !== entry.text && followUp.test(item.text) && !avoid.test(item.text)
+      );
       if (target && !report.clicked.includes(target.text)) {
         console.log(`Second-stage control after opening "${entry.text}": "${target.text}"`);
         await clickClaimControls(page, report, [target.text]);
@@ -419,6 +471,64 @@ async function probeAlternateEntries(page, report) {
     }
 
     if (report.clicked.length) break;
+  }
+
+  return report;
+}
+
+// Try the patterns in order so a real claim button always wins over a task description.
+function pickClaimTarget(candidates, patterns) {
+  const avoid = new RegExp(AVOID_TEXT_PATTERN, "i");
+  for (const pattern of patterns) {
+    const re = new RegExp(pattern, "i");
+    const hit = candidates.find((item) => item.visible && re.test(item.text) && !avoid.test(item.text));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// The credit management page holds the balance and the task list, so it doubles as the
+// verification step: reading it proves the session still works even when nothing is claimable.
+async function openCreditPage(page, report) {
+  const credit = { url: CREDIT_PAGE_URL, finalUrl: "", expanded: "", candidates: [], creditLines: [], clicked: [] };
+  report.creditPage = credit;
+
+  console.log(`Opening credit page: ${CREDIT_PAGE_URL}`);
+  await page.goto(CREDIT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  await settle(page);
+  credit.finalUrl = page.url();
+
+  if (/login|passport|sso|signin/i.test(credit.finalUrl)) {
+    console.log(`Credit page bounced to login: ${credit.finalUrl}`);
+    return report;
+  }
+
+  for (const text of EXPAND_TEXTS) {
+    const locator = page.getByText(text, { exact: false }).first();
+    if (!(await locator.isVisible().catch(() => false))) continue;
+    await locator.click({ timeout: 5000 }).catch(() => {});
+    credit.expanded = text;
+    console.log(`Expanded the task list via: ${text}`);
+    await page.waitForTimeout(2500);
+    break;
+  }
+
+  credit.candidates = await harvestClaimCandidates(page);
+  credit.creditLines = await extractCreditLines(page);
+  await classifyClaimState(page, report);
+
+  const target = pickClaimTarget(credit.candidates, [STRONG_TEXT_PATTERN, CLAIMABLE_TEXT_PATTERN]);
+  if (target) {
+    const before = report.clicked.length;
+    console.log(`Claim-like control on the credit page: "${target.text}"`);
+    await clickClaimControls(page, report, [target.text]);
+    if (report.clicked.length > before) {
+      credit.clicked = report.clicked.slice(before);
+    }
+    credit.creditLines = await extractCreditLines(page);
+    await classifyClaimState(page, report);
+  } else {
+    console.log("No claim-like control on the credit page.");
   }
 
   return report;
@@ -452,7 +562,9 @@ async function classifyClaimState(page, report) {
 
 function extractBalance(bodyText) {
   const patterns = [
-    /积分\D{0,12}([\d,]+(?:\.\d+)?)/,
+    /剩余积分[\s:：]*([\d,]+(?:\.\d+)?)/,
+    /([\d,]+(?:\.\d+)?)\s*积分即将过期/,
+    /积分(?!剩余)[^\d%]{0,12}([\d,]+(?:\.\d+)?)(?!%)/,
     /([\d,]+(?:\.\d+)?)\s*积分/
   ];
   for (const pattern of patterns) {
@@ -464,19 +576,36 @@ function extractBalance(bodyText) {
   return null;
 }
 
+function notificationTitle(report) {
+  const titles = {
+    clicked: "Coze每日积分：已执行领取",
+    "already-claimed": "Coze每日积分：今日已领取过",
+    "no-entry": "Coze每日积分：未见领取入口（余额已读到）",
+    unknown: "Coze每日积分：结果未知"
+  };
+  return titles[report.outcome] || `Coze每日积分：${report.outcome}`;
+}
+
 function buildSuccessMessage(report) {
   const outcomeLabels = {
     clicked: "已尝试点击领取入口",
     "already-claimed": "页面显示今日已领取",
+    "no-entry": "积分管理页可读，但今天没有可点的领取入口",
     unknown: "结果未知（未发现领取入口或已领取标记）"
   };
   const clicked = (report.clickDetails || []).map((item) => item.text);
+  const tasks = (report.creditPage?.candidates || [])
+    .filter((item) => item.visible && /积分|任务/.test(item.text))
+    .slice(0, 4)
+    .map((item) => item.text);
   return [
     `结果：${outcomeLabels[report.outcome] || report.outcome}`,
     clicked.length ? `点击：${clicked.join(" -> ")}` : "",
     report.claimedMarkers.length ? `已领取标记：${report.claimedMarkers.join("、")}` : "",
+    report.balance ? `积分余额：${report.balance}` : "未识别到积分余额（仅供参考，不代表未领取）",
+    tasks.length ? `积分页任务：${tasks.join(" / ")}` : "",
+    report.creditPage?.finalUrl ? `积分页：${report.creditPage.finalUrl}` : "",
     report.creditLines?.length ? `页面积分文本：${report.creditLines.slice(0, 3).join(" / ")}` : "",
-    report.balance ? `识别到积分余额：${report.balance}` : "未识别到积分余额（仅供参考，不代表未领取）",
     `时间：${report.beijingTime}`,
     `页面：${report.pageTitle}`
   ].filter(Boolean).join("\n");
