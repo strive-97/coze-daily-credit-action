@@ -21,6 +21,20 @@ export async function notifyFailure(options = {}) {
   return results.some(Boolean);
 }
 
+export async function notifyResult({ title, content } = {}) {
+  if (!title) {
+    console.log("notifyResult called without title; skip notification.");
+    return false;
+  }
+
+  const results = await Promise.all([
+    sendBark(title, content || ""),
+    sendPushPlus(title, content || "")
+  ]);
+
+  return results.some(Boolean);
+}
+
 async function sendBark(title, content) {
   const base = normalizeBarkUrl(process.env.BARK_PUSH_URL || "");
   if (!base) {
