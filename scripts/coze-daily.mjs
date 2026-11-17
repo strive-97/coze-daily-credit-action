@@ -40,7 +40,9 @@ const CLAIMED_MARKERS = [
 
 // Elements worth looking at when the claim entry is not on the landing page.
 const CANDIDATE_PATTERN = "积分|签到|领取|任务|权益|额度|credit|point|check.?in";
-const CLAIMABLE_TEXT_PATTERN = "领取|签到|免费积分|Get|Claim";
+const CLAIMABLE_TEXT_PATTERN = "领取|签到|积分|免费积分|额度|权益|Get|Claim";
+const FOLLOWUP_TEXT_PATTERN = "领取|签到";
+const CREDIT_LINE_PATTERN = "积分|签到|领取|额度|权益";
 const EXTRA_PROBE_URLS = ["https://www.coze.cn/", "https://www.coze.cn/overview"];
 
 async function main() {
@@ -97,6 +99,7 @@ async function main() {
       const unknownError = new Error(
         `签到结果未知：落地页 ${report.url || targetUrl}（标题：${report.pageTitle || "无"}）` +
         `既没有可点击的领取入口，也没有“已领取/已签到”标记。疑似入口元素：${preview}。` +
+        `页面积分相关文本：${(report.creditLines || []).slice(0, 4).join(" / ") || "无"}。` +
         `完整清单见运行日志的 Claim report，页面截图在 coze-failure artifact 里。`
       );
       await captureFailure(context, unknownError);
@@ -229,9 +232,11 @@ async function claimDaily(page) {
   const report = {
     outcome: "unknown",
     clicked: [],
+    clickDetails: [],
     claimedMarkers: [],
     candidates: [],
     probed: [],
+    creditLines: [],
     balance: null,
     pageTitle: "",
     url: "",
@@ -245,41 +250,45 @@ async function claimDaily(page) {
   if (report.claimedMarkers.length) {
     report.outcome = "already-claimed";
     console.log("Already-claimed markers found; skip clicking.");
+    report.creditLines = await extractCreditLines(page);
     return report;
   }
 
+  report.candidates = await harvestClaimCandidates(page);
   await clickClaimControls(page, report);
-  if (!report.clicked.length) {
-    report.candidates = await harvestClaimCandidates(page);
-  }
+  report.creditLines = await extractCreditLines(page);
   return report;
 }
 
-async function clickClaimControls(page, report) {
+async function clickClaimControls(page, report, texts) {
   const configuredTexts = (process.env.COZE_CLICK_TEXTS || "")
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-  const texts = configuredTexts.length ? configuredTexts : DEFAULT_CLICK_TEXTS;
+  const clickTexts = texts || (configuredTexts.length ? configuredTexts : DEFAULT_CLICK_TEXTS);
 
-  for (const text of texts) {
+  for (const text of clickTexts) {
     const locator = page.getByText(text, { exact: false }).first();
     const visible = await locator.isVisible().catch(() => false);
     if (!visible) continue;
 
+    const html = await describeElement(locator);
     await locator.click({ timeout: 5000 }).catch(() => {});
-    report.clicked.push(text);
+    recordClick(report, text, html, page.url());
     console.log(`Clicked possible claim control: ${text}`);
     await page.waitForTimeout(2000);
+    report.creditLines = await extractCreditLines(page);
 
     for (const confirmText of CONFIRM_TEXTS) {
       const confirm = page.getByText(confirmText, { exact: false }).first();
       const confirmVisible = await confirm.isVisible().catch(() => false);
       if (!confirmVisible) continue;
+      const confirmHtml = await describeElement(confirm);
       await confirm.click({ timeout: 5000 }).catch(() => {});
-      report.clicked.push(confirmText);
+      recordClick(report, confirmText, confirmHtml, page.url());
       console.log(`Clicked follow-up control: ${confirmText}`);
       await page.waitForTimeout(2000);
+      report.creditLines = await extractCreditLines(page);
       break;
     }
     break;
@@ -289,6 +298,40 @@ async function clickClaimControls(page, report) {
     console.log("No claim-like control found on this page.");
   }
   return report;
+}
+
+function recordClick(report, text, html, url) {
+  report.clicked.push(text);
+  report.clickDetails = report.clickDetails || [];
+  report.clickDetails.push({ text, url, html });
+  if (html) {
+    console.log(`  clicked element: ${html.slice(0, 160)}`);
+  }
+}
+
+async function describeElement(locator) {
+  return locator
+    .evaluate((el) => el.outerHTML.replace(/\s+/g, " ").trim().slice(0, 200))
+    .catch(() => "");
+}
+
+async function extractCreditLines(page) {
+  const bodyText = (await page.locator("body").innerText({ timeout: 8000 }).catch(() => "")).slice(0, 40000);
+  const pattern = new RegExp(CREDIT_LINE_PATTERN, "i");
+  const lines = bodyText
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line && line.length <= 90 && pattern.test(line));
+  const unique = [...new Set(lines)].slice(0, 12);
+  if (unique.length) {
+    console.log(`Credit-related text on ${page.url()}:`);
+    for (const line of unique) {
+      console.log(`  - ${line}`);
+    }
+  } else {
+    console.log(`No credit-related text found on ${page.url()}.`);
+  }
+  return unique;
 }
 
 async function harvestClaimCandidates(page) {
@@ -330,6 +373,7 @@ async function harvestClaimCandidates(page) {
 
 async function probeAlternateEntries(page, report) {
   const claimable = new RegExp(CLAIMABLE_TEXT_PATTERN, "i");
+  const followUp = new RegExp(FOLLOWUP_TEXT_PATTERN);
   const urls = EXTRA_PROBE_URLS.filter((url) => url && url !== page.url());
 
   for (const url of urls) {
@@ -346,13 +390,35 @@ async function probeAlternateEntries(page, report) {
     }
 
     const candidates = await harvestClaimCandidates(page);
-    report.probed.push({ url, finalUrl: page.url(), candidates: candidates.slice(0, 12) });
+    const entry = candidates.find((item) => item.visible && claimable.test(item.text));
+    report.probed.push({
+      url,
+      finalUrl: page.url(),
+      entry: entry ? entry.text : "",
+      candidates: candidates.slice(0, 12)
+    });
 
-    const target = candidates.find((item) => item.visible && claimable.test(item.text));
-    if (!target) continue;
+    if (!entry) {
+      report.creditLines = await extractCreditLines(page);
+      continue;
+    }
 
-    console.log(`Claim-like element found on ${page.url()}: "${target.text}"`);
-    await clickClaimControls(page, report);
+    console.log(`Claim-like element found on ${page.url()}: "${entry.text}"`);
+    await clickClaimControls(page, report, [entry.text]);
+
+    if (report.clicked.length) {
+      await settle(page);
+      const inside = await harvestClaimCandidates(page);
+      const target = inside.find((item) => item.visible && item.text !== entry.text && followUp.test(item.text));
+      if (target && !report.clicked.includes(target.text)) {
+        console.log(`Second-stage control after opening "${entry.text}": "${target.text}"`);
+        await clickClaimControls(page, report, [target.text]);
+        report.creditLines = await extractCreditLines(page);
+      }
+      report.probed.push({ url, finalUrl: page.url(), stage: "after entry click", candidates: inside.slice(0, 12) });
+    }
+
+    if (report.clicked.length) break;
   }
 
   return report;
@@ -404,10 +470,12 @@ function buildSuccessMessage(report) {
     "already-claimed": "页面显示今日已领取",
     unknown: "结果未知（未发现领取入口或已领取标记）"
   };
+  const clicked = (report.clickDetails || []).map((item) => item.text);
   return [
     `结果：${outcomeLabels[report.outcome] || report.outcome}`,
-    report.clicked.length ? `点击：${report.clicked.join(" -> ")}` : "",
+    clicked.length ? `点击：${clicked.join(" -> ")}` : "",
     report.claimedMarkers.length ? `已领取标记：${report.claimedMarkers.join("、")}` : "",
+    report.creditLines?.length ? `页面积分文本：${report.creditLines.slice(0, 3).join(" / ")}` : "",
     report.balance ? `识别到积分余额：${report.balance}` : "未识别到积分余额（仅供参考，不代表未领取）",
     `时间：${report.beijingTime}`,
     `页面：${report.pageTitle}`
