@@ -38,6 +38,11 @@ const CLAIMED_MARKERS = [
   "明日可领"
 ];
 
+// Elements worth looking at when the claim entry is not on the landing page.
+const CANDIDATE_PATTERN = "积分|签到|领取|任务|权益|额度|credit|point|check.?in";
+const CLAIMABLE_TEXT_PATTERN = "领取|签到|免费积分|Get|Claim";
+const EXTRA_PROBE_URLS = ["https://www.coze.cn/", "https://www.coze.cn/overview"];
+
 async function main() {
   await fs.mkdir(ARTIFACT_DIR, { recursive: true });
   await materializeStorageState();
@@ -71,6 +76,12 @@ async function main() {
     await assertLoggedIn(page);
     await classifyClaimState(page, report);
 
+    if (report.outcome === "unknown") {
+      await probeAlternateEntries(page, report);
+      await settle(page);
+      await classifyClaimState(page, report);
+    }
+
     await context.storageState({ path: UPDATED_STORAGE_STATE_PATH });
 
     console.log("Claim report:", JSON.stringify(report, null, 2));
@@ -78,10 +89,15 @@ async function main() {
     console.log(`Updated storage state written to ${UPDATED_STORAGE_STATE_PATH}`);
 
     if (report.outcome === "unknown" && process.env.COZE_CLAIM_STRICT !== "0") {
+      const preview = (report.candidates || [])
+        .slice(0, 5)
+        .map((item) => item.text)
+        .filter(Boolean)
+        .join("、") || "无";
       const unknownError = new Error(
-        "签到结果未知：页面既没有可点击的领取入口，也没有“已领取/已签到”标记。" +
-        "可能是 Coze 页面改版（选择器失效）或登录态异常。请下载本次运行的 coze-failure 截图/HTML 核对，" +
-        "确认为误报后可在仓库变量把 COZE_CLAIM_STRICT 设为 0。"
+        `签到结果未知：落地页 ${report.url || targetUrl}（标题：${report.pageTitle || "无"}）` +
+        `既没有可点击的领取入口，也没有“已领取/已签到”标记。疑似入口元素：${preview}。` +
+        `完整清单见运行日志的 Claim report，页面截图在 coze-failure artifact 里。`
       );
       await captureFailure(context, unknownError);
       throw unknownError;
@@ -214,6 +230,8 @@ async function claimDaily(page) {
     outcome: "unknown",
     clicked: [],
     claimedMarkers: [],
+    candidates: [],
+    probed: [],
     balance: null,
     pageTitle: "",
     url: "",
@@ -230,6 +248,14 @@ async function claimDaily(page) {
     return report;
   }
 
+  await clickClaimControls(page, report);
+  if (!report.clicked.length) {
+    report.candidates = await harvestClaimCandidates(page);
+  }
+  return report;
+}
+
+async function clickClaimControls(page, report) {
   const configuredTexts = (process.env.COZE_CLICK_TEXTS || "")
     .split(",")
     .map((item) => item.trim())
@@ -260,8 +286,75 @@ async function claimDaily(page) {
   }
 
   if (!report.clicked.length) {
-    console.log("No claim-like control found on first pass.");
+    console.log("No claim-like control found on this page.");
   }
+  return report;
+}
+
+async function harvestClaimCandidates(page) {
+  const found = await page
+    .evaluate((pattern) => {
+      const re = new RegExp(pattern, "i");
+      const seen = new Set();
+      const items = [];
+      for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+        const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
+        const rawHref = el.getAttribute("href") || "";
+        if (!text && !rawHref) continue;
+        if (!re.test(text) && !re.test(rawHref)) continue;
+        const rect = el.getBoundingClientRect();
+        const key = `${text}|${rawHref}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({
+          text,
+          href: rawHref.slice(0, 140),
+          visible: rect.width > 0 && rect.height > 0
+        });
+        if (items.length >= 25) break;
+      }
+      return items;
+    }, CANDIDATE_PATTERN)
+    .catch(() => []);
+
+  if (found.length) {
+    console.log(`Claim-like elements on ${page.url()}:`);
+    for (const item of found) {
+      console.log(`  - [${item.visible ? "v" : "h"}] "${item.text}" -> ${item.href || "(no href)"}`);
+    }
+  } else {
+    console.log(`No claim-like elements found on ${page.url()}.`);
+  }
+  return found;
+}
+
+async function probeAlternateEntries(page, report) {
+  const claimable = new RegExp(CLAIMABLE_TEXT_PATTERN, "i");
+  const urls = EXTRA_PROBE_URLS.filter((url) => url && url !== page.url());
+
+  for (const url of urls) {
+    if (report.clicked.length || report.claimedMarkers.length) break;
+
+    console.log(`Probing entry page: ${url}`);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await settle(page);
+
+    if (/login|passport|sso|signin/i.test(page.url())) {
+      report.probed.push({ url, finalUrl: page.url(), note: "redirected to login" });
+      console.log(`Probe bounced to login: ${page.url()}`);
+      continue;
+    }
+
+    const candidates = await harvestClaimCandidates(page);
+    report.probed.push({ url, finalUrl: page.url(), candidates: candidates.slice(0, 12) });
+
+    const target = candidates.find((item) => item.visible && claimable.test(item.text));
+    if (!target) continue;
+
+    console.log(`Claim-like element found on ${page.url()}: "${target.text}"`);
+    await clickClaimControls(page, report);
+  }
+
   return report;
 }
 
