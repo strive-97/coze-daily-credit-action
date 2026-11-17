@@ -40,7 +40,6 @@ const CLAIMED_MARKERS = [
 
 // Elements worth looking at when the claim entry is not on the landing page.
 const CANDIDATE_PATTERN = "积分|签到|领取|任务|权益|额度|credit|point|check.?in";
-const CLAIMABLE_TEXT_PATTERN = "领取|签到|积分|免费积分|额度|权益|Get|Claim";
 const STRONG_TEXT_PATTERN = "领取|签到|Claim|Get";
 const FOLLOWUP_TEXT_PATTERN = "领取|签到";
 const CREDIT_LINE_PATTERN = "积分|签到|领取|额度|权益";
@@ -440,7 +439,7 @@ async function probeAlternateEntries(page, report) {
     }
 
     const candidates = await harvestClaimCandidates(page);
-    const entry = pickClaimTarget(candidates, [STRONG_TEXT_PATTERN, CLAIMABLE_TEXT_PATTERN]);
+    const entry = pickClaimTarget(candidates, [STRONG_TEXT_PATTERN]);
     report.probed.push({
       url,
       finalUrl: page.url(),
@@ -517,7 +516,9 @@ async function openCreditPage(page, report) {
   credit.creditLines = await extractCreditLines(page);
   await classifyClaimState(page, report);
 
-  const target = pickClaimTarget(credit.candidates, [STRONG_TEXT_PATTERN, CLAIMABLE_TEXT_PATTERN]);
+  // The credit page also lists monthly streak tasks whose text contains "积分"; those are
+  // awarded automatically, so only a real claim button is worth clicking here.
+  const target = pickClaimTarget(credit.candidates, [STRONG_TEXT_PATTERN]);
   if (target) {
     const before = report.clicked.length;
     console.log(`Claim-like control on the credit page: "${target.text}"`);
