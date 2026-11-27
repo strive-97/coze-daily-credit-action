@@ -615,7 +615,11 @@ function notificationTitle(report) {
   const titles = {
     clicked: "Coze每日积分：已执行领取",
     "already-claimed": "Coze每日积分：今日已领取过",
-    "no-entry": "Coze每日积分：未见领取入口（余额已读到）",
+    // Once the daily claim is done the entry legitimately disappears, so lead with the
+    // balance instead of the missing entry — the number is the actual proof of arrival.
+    "no-entry": report.balance
+      ? `Coze每日积分：余额已到账 ${report.balance}`
+      : "Coze每日积分：积分页已登录，余额未读到",
     unknown: "Coze每日积分：结果未知"
   };
   return titles[report.outcome] || `Coze每日积分：${report.outcome}`;
