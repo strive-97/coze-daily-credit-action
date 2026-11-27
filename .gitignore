@@ -8,3 +8,6 @@ cookies.json
 .env
 .DS_Store
 __pycache__/
+local/secrets.cmd
+local/run.log
+local/node/

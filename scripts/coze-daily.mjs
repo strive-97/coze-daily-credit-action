@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { notifyFailure, notifyResult } from "./notifications.mjs";
+import { cookieExpiryInfo, cookieExpiryLine, cookieRenewalHint } from "./cookie-health.mjs";
 
 const ROOT = process.cwd();
 const ARTIFACT_DIR = path.join(ROOT, "artifacts");
@@ -57,6 +58,10 @@ async function main() {
   await fs.mkdir(ARTIFACT_DIR, { recursive: true });
   await materializeStorageState();
 
+  const cookieInfo = cookieExpiryInfo();
+  console.log(`Cookie expiry check: ${JSON.stringify(cookieInfo)}`);
+  console.log(cookieExpiryLine(cookieInfo));
+
   const launchOptions = {
     headless: process.env.HEADLESS !== "false"
   };
@@ -64,15 +69,27 @@ async function main() {
     launchOptions.channel = process.env.PLAYWRIGHT_CHANNEL;
   }
 
-  const browser = await chromium.launch(launchOptions);
-
-  let context;
+  // A persistent profile lets the same script run on a real machine and keep the login
+  // across days instead of relying on an exported cookie blob.
+  const profileDir = process.env.COZE_PROFILE_DIR?.trim();
+  let browser = null;
+  let context = null;
   try {
-    context = await browser.newContext({
-      locale: "zh-CN",
-      timezoneId: "Asia/Shanghai",
-      storageState: STORAGE_STATE_PATH
-    });
+    if (profileDir) {
+      await fs.mkdir(profileDir, { recursive: true });
+      context = await chromium.launchPersistentContext(profileDir, {
+        ...launchOptions,
+        locale: "zh-CN",
+        timezoneId: "Asia/Shanghai"
+      });
+    } else {
+      browser = await chromium.launch(launchOptions);
+      context = await browser.newContext({
+        locale: "zh-CN",
+        timezoneId: "Asia/Shanghai",
+        storageState: STORAGE_STATE_PATH
+      });
+    }
 
     const page = await context.newPage();
     page.setDefaultTimeout(Number(process.env.PLAYWRIGHT_TIMEOUT_MS || 30000));
@@ -123,9 +140,10 @@ async function main() {
     }
 
     if (process.env.COZE_NOTIFY_SUCCESS !== "0") {
+      const expiringSoon = cookieInfo.daysLeft !== null && cookieInfo.daysLeft <= 2;
       const notified = await notifyResult({
-        title: notificationTitle(report),
-        content: buildSuccessMessage(report)
+        title: `${expiringSoon ? `【登录态只剩 ${cookieInfo.daysLeft} 天】` : ""}${notificationTitle(report)}`,
+        content: buildSuccessMessage(report, cookieInfo)
       });
       if (notified) {
         await fs.writeFile(NOTIFICATION_SENT_PATH, new Date().toISOString(), "utf8").catch(() => {});
@@ -136,7 +154,8 @@ async function main() {
     const notified = await notifyFailure({
       error,
       runUrl,
-      repository: process.env.GITHUB_REPOSITORY
+      repository: process.env.GITHUB_REPOSITORY,
+      extra: cookieRenewalHint(error, cookieInfo)
     });
     if (notified) {
       await fs.writeFile(NOTIFICATION_SENT_PATH, new Date().toISOString(), "utf8").catch(() => {});
@@ -144,7 +163,7 @@ async function main() {
     throw error;
   } finally {
     await context?.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await browser?.close().catch(() => {});
   }
 }
 
@@ -160,6 +179,11 @@ async function materializeStorageState() {
   }
 
   if (!cookiesJson) {
+    if (process.env.COZE_PROFILE_DIR?.trim()) {
+      // Local mode keeps its login in the browser profile, so an empty state is fine.
+      await fs.writeFile(STORAGE_STATE_PATH, JSON.stringify({ cookies: [], origins: [] }, null, 2), "utf8");
+      return;
+    }
     throw new Error("Missing COZE_STORAGE_STATE_JSON or COZE_COOKIES_JSON secret.");
   }
 
@@ -200,10 +224,11 @@ function normalizeCookie(cookie) {
     sameSite: normalizeSameSite(cookie.sameSite)
   };
 
-  if (typeof cookie.expires === "number") {
-    normalized.expires = cookie.expires;
-  } else if (typeof cookie.expirationDate === "number") {
-    normalized.expires = cookie.expirationDate;
+  // Playwright reports session cookies with expires === -1; writing that back would mean
+  // "already expired", so the field is only kept for real expiry timestamps.
+  const expiry = Number(cookie.expires ?? cookie.expirationDate);
+  if (Number.isFinite(expiry) && expiry > 0) {
+    normalized.expires = expiry;
   }
 
   return normalized;
@@ -229,7 +254,16 @@ function normalizeSameSite(value) {
 async function assertLoggedIn(page) {
   const url = page.url();
   if (/login|passport|sso|signin/i.test(url)) {
-    throw new Error(`Login appears expired; current URL is ${url}`);
+    // The full Volcengine SSO URL is huge and swallows the pushplus message, so only
+    // origin + path is quoted.
+    let shownUrl = url;
+    try {
+      const parsed = new URL(url);
+      shownUrl = `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      shownUrl = url.slice(0, 120);
+    }
+    throw new Error(`Login appears expired; current URL is ${shownUrl}`);
   }
 
   const loginControls = await page
@@ -587,7 +621,7 @@ function notificationTitle(report) {
   return titles[report.outcome] || `Coze每日积分：${report.outcome}`;
 }
 
-function buildSuccessMessage(report) {
+function buildSuccessMessage(report, cookieInfo = cookieExpiryInfo()) {
   const outcomeLabels = {
     clicked: "已尝试点击领取入口",
     "already-claimed": "页面显示今日已领取",
@@ -607,6 +641,10 @@ function buildSuccessMessage(report) {
     tasks.length ? `积分页任务：${tasks.join(" / ")}` : "",
     report.creditPage?.finalUrl ? `积分页：${report.creditPage.finalUrl}` : "",
     report.creditLines?.length ? `页面积分文本：${report.creditLines.slice(0, 3).join(" / ")}` : "",
+    cookieExpiryLine(cookieInfo),
+    cookieInfo.daysLeft !== null && cookieInfo.daysLeft <= 2
+      ? "提醒：登录态快到期了，提前重新登录并更新 COZE_COOKIES_JSON，否则明天开始就会漏领。"
+      : "",
     `时间：${report.beijingTime}`,
     `页面：${report.pageTitle}`
   ].filter(Boolean).join("\n");

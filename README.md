@@ -82,6 +82,29 @@ Actions 里显示绿色只代表"脚本没报错"，不代表积分到账。脚�
 
 运行日志里的 `Claim report` 会记录：点到的元素原文（`clickDetails`，含该元素的 HTML 片段）、页面上所有与积分相关的文本（`creditLines`）、积分管理页读到的候选任务（`creditPage.candidates`）以及余额（`balance`）。
 
+## 登录态过期预警
+
+Coze（火山引擎）的登录 Cookie 是有寿命的，实测大约 6～7 天就会在服务端被注销，届时脚本会掉到 `signin.volcengine.com` 并报 `Login appears expired`。为了让这件事提前暴露而不是连续好几天白掉积分，脚本每次运行都会读 Secret 里的 Cookie，挑出登录相关的条目（`sessionid` / `sid_tt` / `sid_guard` / `uid_tt` / `ttwid` / `passport_*`），在日志和推送里写一行：
+
+```
+Cookie：共 23 条，最早过期的登录条目 sessionid 在 2026-12-04（还剩约 5 天）
+```
+
+还剩 2 天及以内时，推送标题会加上 `【登录态只剩 N 天】`；已经过期或本来就是会话级 Cookie 时，失败推送里会直接给出重新登录并更新 `COZE_COOKIES_JSON` 的操作步骤。
+
+## 可选：在自己电脑上跑（本机模式）
+
+GitHub Actions 有两个绕不开的毛病：定时调度会延迟几小时，以及 Cookie 要从浏览器导出再贴进 Secret。脚本支持本机模式来省掉这两件事——登录态保存在一个持久化浏览器档案里，每天定时无头跑一次，到期只要在那个档案里重新登录一次即可。
+
+先装好 Node.js（或用便携版解压到 `local/node/`），在仓库根目录执行 `npm install` 和 `npx playwright install chromium`，然后：
+
+1. 复制 `local/secrets.example.cmd` 为 `local/secrets.cmd`，填入 `PUSHPLUS_TOKEN`（这个文件已被 .gitignore 排除）。
+2. 双击 `local/run-login-once.bat`，在弹出的浏览器里登录 `https://www.coze.cn`，登录成功（页面能看到自己的会话）后关掉窗口。
+3. 运行一次 `powershell -ExecutionPolicy Bypass -File local\register-task.ps1`，它会注册一个每天 04:20 触发、允许从睡眠唤醒的计划任务 `CozeDailyCredit`；日志追加在 `local/run.log`。
+4. 想验证就 `Start-ScheduledTask -TaskName CozeDailyCredit`，然后看 `local/run.log` 里的 `Claim report`。
+
+本机模式下 `COZE_COOKIES_JSON` 不再需要，但仓库里的 workflow 仍会按计划跑并因为读不到有效 Cookie 而报错推送。要么把 Secret 更新一次让它继续用 GitHub，要么在仓库的 `Actions` 页面把这条 workflow `Disable workflow`，避免重复推送。
+
 ## 可选高级配置
 
 这些配置不是开箱即用必需项，不确定就不要填。

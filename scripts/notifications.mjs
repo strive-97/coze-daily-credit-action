@@ -1,9 +1,10 @@
-function buildFailureMessage({ error, message, runUrl, repository } = {}) {
+function buildFailureMessage({ error, message, runUrl, repository, extra } = {}) {
   if (message) return message;
 
   return [
     "Coze 每日积分任务失败。",
     error ? `原因：${error?.message || String(error)}` : "",
+    extra || "",
     repository ? `仓库：${repository}` : "",
     runUrl ? `运行记录：${runUrl}` : ""
   ].filter(Boolean).join("\n");

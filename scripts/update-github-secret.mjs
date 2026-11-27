@@ -48,7 +48,11 @@ function filterCookies(cookies) {
     httpOnly: Boolean(cookie.httpOnly),
     secure: cookie.secure !== false,
     sameSite: cookie.sameSite || "Lax",
-    ...(typeof cookie.expires === "number" ? { expires: cookie.expires } : {})
+    // Playwright marks session cookies with expires === -1; keeping that would write an
+    // already-expired cookie into the secret.
+    ...(Number.isFinite(Number(cookie.expires)) && Number(cookie.expires) > 0
+      ? { expires: Number(cookie.expires) }
+      : {})
   }));
 }
 
